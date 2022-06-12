@@ -1,6 +1,7 @@
 #Developed by Fred Davey
 #Custom Stock Data Browser
 #Intended to be used for custom indicator definitions and exploration of stocks utilizing statistical methods not available in common charting software.
+#Note-- there is no warranty provided with this software.  Any user who actively trades with this software is encouraged to do their own validations.
 
 #Imports
 library(shiny)
@@ -122,7 +123,13 @@ fnLiveIndicators<- function(aDataFrame){
 }
 
 #1.C Psuedo live querying -- read .csv files row by row to simulate active trade day on weekends.  Could also be used to review trades / practice.
-fnStepThroughHistorical <- function(){
+#Input -- Dataframe imported as a global variable from previous yahoo queries -- need an extra `Index` field based on query timestamp.  2nd argument is an index to hook into the extra field.
+#Actions -- Takes Modulus of index vs maximum file index.  Takes file at filepath and subsets out the requested index
+#Output -- One Set of Quotes
+fnStepThroughHistorical <- function(aDataFrame, aIndex){
+  fMaxIndex = max(aDataFrame$Index)
+  
+  return(aDataFrame[aDataFrame$Index == aIndex%%fMaxIndex,])
   
 } 
 
@@ -172,17 +179,6 @@ fnSlowCalcSlope <- function(aDataFrame, aAlpha = .99) {
   return(tibble(estimate = bMat[2,1], std.error = seSlope, lowerCI = bMat[2,1] + seSlope *qnorm((1-aAlpha)/2), upperCI = estimate - std.error *qnorm((1-aAlpha)/2)))
 }
 
-#5 Calculate regression parameters vs SPY
-
-#6 Perform a mean offset on SPY data for single-axis plotting against Ticker (since Hadley Wickham is strongly opposed to multiple Y axes)
-#Input - dataframe with `% Change` columns.  Expected to have 'SPY' and one other ticker of interest.
-#Actions -- Creates a column where the SPY % change vs open has an offset added to it so it will plot centered on the relative changes of a different ticker.
-fnOffsetSpy <- function(aDataFrame){
-  offset = mean(tempData$`% Change`[tempData$Symbol == 'AMD']) - mean(tempData$`% Change`[tempData$Symbol == 'SPY'])
-  aDataFrame <- aDataFrame %>% mutate (plotLast = case_when(Symbol == 'SPY' ~ `% Change` + offset, TRUE ~ `% Change`))
-  return(aDataFrame)
-}
-
 #####
 #Global Variables
 #1. 
@@ -192,7 +188,20 @@ fnOffsetSpy <- function(aDataFrame){
 #http://www.nasdaq.com/screening/companies-by-name.aspx?letter=0&exchange=all&render=download 
 StockTickers<- read_csv("C:/Users/Fred/Documents/GitHub/Stock Dashboard/Stock-Dashboard/HighMKTCapHighVolTickers_20220610.csv")$value
 #2. Local Dataset with SPY and one other ticker for evaluation
-tempData <- read_csv("C:/Users/Fred/Documents/R/Sample Data/AMDSPY_4secQuotes.csv")
+#Hide this in a function that's easy to comment out when unnecessary.
+fnPopulateParentTempDataFrame<- function(){
+fTempData <- read_csv("C:/Users/Fred/Documents/R/Sample Data/HighValue_4secQuotes_1hr.csv")
+fTempDF = numeric()
+for(i in 1:(nrow(fTempData) / 496)){
+  
+  fTempDF = c(fTempDF, replicate(496, i))
+}
+fTempData <- bind_cols(fTempData, as_tibble(fTempDF))
+fTempData <- fTempData%>% rename(Index = value)
+return(fTempData)
+}
+tempData <- fnPopulateParentTempDataFrame()
+
 
 #Shiny App Functions -- UI Layout and Server Logic
 # Define UI for application for convenient real time stock feedback
@@ -206,21 +215,21 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       #Text Input Box to Pull a Ticker
-      textInput('TickerSearch', label = 'Specify Ticker'),
-      submitButton('Submit New Ticker'),          
+      textInput('TickerSearch', label = 'Specify Ticker', value = "AMD"),
       
       #List of everything pulled currently
       dataTableOutput("IndicatorList"),
-      #Toggles to parse down for RS / RW / Volume
+      
+      #Filters toggles for RS / RW / Volume
       
     ),
     
     # Plots
     mainPanel(
-      plotOutput("ChartVsSpy"),
-      plotOutput("VolumeProfile"), 
+      plotOutput("Chart"),
+      #plotOutput("VolumeProfile"), 
       #plotOutput("IndicatorVsTime"),
-      #plotOutput("IndicatorBivariate")
+
     )
   )
 )
@@ -229,29 +238,44 @@ ui <- fluidPage(
 #Server
 #####
 server <- function(input, output) {
-  #Three things need to be going on with data.
-  #1 - Querying yahoo for new quotes
-  #2 - Updating all tickers for required metrics
-  #3 - Cleaning data for SPY & selected ticker ( & sector?) to plot
+  #Initialize our datasets
+  print('frequencyTest, initializing everything')
+  WorkingDataset = NULL
+  WorkingDataset = bind_rows(WorkingDataset, fnStepThroughHistorical(tempData, 1))
   
-  tempData <- tempData %>% arrange(Symbol, `Trade Time`)
-  tempData <- tempData %>% mutate (intervalVolume = case_when(Symbol == lag(Symbol)~Volume - lag(Volume)))
-  
-  tempData <- fnOffsetSpy(tempData)
-  
-  print('frequencytest')
-  
-  output$ChartVsSpy <- renderPlot({
-    ggplot(data = tempData, aes(x = `Trade Time`, y= plotLast)) + geom_line(aes(group = Symbol)) + geom_point(aes(color = Symbol)) 
+  #Need to put dataset into a reactive container so that the changes in observe calls stick.
+  reactiveData <- reactiveValues( convolutedWork = WorkingDataset,  i = 2 )
+  #Any code chunks that call auto invalidate will refresh after the specified duration (milliseconds)
+  autoInvalidate <- reactiveTimer(4000)
+  #wrap this code to be a reactive expression)
+  observe({
+    autoInvalidate()
+    print(paste0('immediately after this invalidation call, i is: ', isolate({reactiveData$i})))
+    isolate({reactiveData$convolutedWork = bind_rows(reactiveData$convolutedWork, fnStepThroughHistorical(tempData, reactiveData$i))})
+    isolate({reactiveData$i = reactiveData$i+1})
+    isolate({print(paste0('now that i have updated data and it should have updated i as well, i is: ', reactiveData$i))})
+    isolate({print(paste0('length of working dataset is: ', nrow(reactiveData$convolutedWork)))})
   })
   
-  output$VolumeProfile <- renderPlot({
-    ggplot(data = tempData, aes(x = `Trade Time`, y= plotLast))+ geom_violin(aes(weight = intervalVolume, group = Symbol, color = Symbol, fill = Symbol,  alpha = 255)) 
+  output$Chart <- renderPlot({
+    autoInvalidate()
+    
+    isolate({
+      ggplot(data = reactiveData$convolutedWork[reactiveData$convolutedWork$Symbol == input$TickerSearch,], aes(x = `Trade Time`, y= Last)) + 
+      geom_line() + geom_point() + labs(title = input$TickerSearch)
+    })
   })
+
+  # 
+  # output$VolumeProfile <- renderPlot({
+  #   ggplot(data = tempData, aes(x = `Trade Time`, y= Last))+ geom_violin(aes(weight = intervalVolume, color = Symbol, fill = Symbol,  alpha = 255)) 
+  # })
   
   #output$IndicatorVsTime <- renderPlot({})
   #output$IndicatorBivariate <- renderPlot({})
-}
+
+  #onStop(write_csv(WorkingDataset, paste0('sessionDataset_', date(Sys.time()))))
+  }
 
 # Run the application 
 shinyApp(ui = ui, server = server)
