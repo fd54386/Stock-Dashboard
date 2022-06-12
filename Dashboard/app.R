@@ -7,8 +7,10 @@ library(shiny)
 library(plotly)
 library(tidyverse)
 library(tidyquant)
+library(quantreg)
+library(broom)
 
-#Programmer Defined Functions
+#Locally Defined Functions
 #####
 #1. 
 #Convoluted free way to get sub-minute stock data off Yahoo Finance.  Some free but rate limited 1 min interval options are available off Tiingo API (paid is $10). Yahoo solution is better able to view the whole market (and let's be honest tick closes are just as arbitrary)
@@ -41,9 +43,6 @@ fnPullQuoteDataHours_SplitYahoo<- function(aTickerList, aHours, aPeriod_sec = 5,
       recentQuote<- getQuote(fTickerShort)
       recentQuote<- rownames_to_column(recentQuote, var = 'Symbol')
       
-      spyQuote <- getQuote('SPY')
-      spyQuote <- spyQuote %>% select(Last) %>% rename(SPY = Last)
-      
       recentQuote <- cbind(recentQuote, spyQuote)
       
       fQueryTibble <- bind_rows(fQueryTibble, recentQuote)
@@ -51,10 +50,10 @@ fnPullQuoteDataHours_SplitYahoo<- function(aTickerList, aHours, aPeriod_sec = 5,
     
     if(!is.null(fPrevQuote)){
       fQueryTibble <- inner_join(fQueryTibble, fPrevQuote, by = Symbol)%>% 
-        mutate(relSpy = (SPY - LastSPY)/LastSPY, relTick = (Last - LastTick) / Last, intrVol = Volume - LastVolume )%>% Select(Symbol, `Trade Time`, Last, Change, `% Change`, Open, High, Low, Volume, SPY, relSpy, relTick, intrVol)
+        mutate(intrVol = Volume - LastVolume )%>% Select(Symbol, `Trade Time`, Last, Change, `% Change`, Open, High, Low, Volume, SPY, relSpy, relTick, intrVol)
     }
     
-    fPrevQuote <- fQueryTibble %>% select(Symbol, Last, SPY, Volume) %>% rename(LastTick = Last, LastSPY = SPY, LastVolume = Volume)
+    fPrevQuote <- fQueryTibble %>% select(Symbol, Volume) %>% rename(LastVolume = Volume)
     
     fQueryTibble %>% mutate(appendTime = Sys.time())
     p2 <- Sys.time()
@@ -114,8 +113,18 @@ fnAddIntradayIndicatorCols <- function(aRecentDatapoints, aMasterDataFrame, aPer
 #Output -- Single row tibble with only the indicator output columns
 #Note -- currently only adding one set of indicator variables.  Would potentially modify fn 1A to run a list of indicator functions in a loop, each would have a different 1.B equivalent
 fnLiveIndicators<- function(aDataFrame){
-  
+  #For a demo, we are going to run a robust regresion (IE -- has less weight on outliers than LeastSquares Regression) and report all parameters and CIs
+  #rq function from the quantreg package -- LAD regression
+  #times %%86400 -> times go from absolute dates to hours since midnight.  This helps with precision & helps the function solve.  With full date, the regression was computationally singular.
+  fTrendFit<- rq(formula = Last~(as.numeric(`Trade Time`)%% 86400), data = aDataFrame)
+  fParams <- tidy(fTrendFit)
+  return(tibble(Slope = as.numeric(fParams[2,1]), SloLoCI = as.numeric(fParams[2,2]), SloUpCI = as.numeric(fParams[2,3])))
 }
+
+#1.C Psuedo live querying -- read .csv files row by row to simulate active trade day on weekends.  Could also be used to review trades / practice.
+fnStepThroughHistorical <- function(){
+  
+} 
 
 #2. For finished datasets, apply indicator functions. Has more flexibility than a mutate() & lag() design. Also more efficient than recalculating a master table
 #Inputs -- The name of the function that generates your indicator (can we change this into a list long term?), and the tibble used for calculations.  Also accepts pass through variables for the indicator function.
@@ -224,6 +233,7 @@ server <- function(input, output) {
   #1 - Querying yahoo for new quotes
   #2 - Updating all tickers for required metrics
   #3 - Cleaning data for SPY & selected ticker ( & sector?) to plot
+  
   tempData <- tempData %>% arrange(Symbol, `Trade Time`)
   tempData <- tempData %>% mutate (intervalVolume = case_when(Symbol == lag(Symbol)~Volume - lag(Volume)))
   
