@@ -1,10 +1,19 @@
 #Developed by Fred Davey
 #Custom Stock Data Browser
-#Intended to be used for custom indicator definitions and exploration of stocks utilizing statistical methods not available in common charting software.
+#This project is intended to be used for custom indicator definitions and exploration of stocks utilizing statistical methods not available in common charting software.
 #Note-- there is no warranty provided with this software.  Any user who actively trades with this software is encouraged to do their own validations.
 
-#This software is still heavily under development.  Needs lots of massaging to get the appropriate data hooked up.  Also likely has major memory leaks.
+#This file is for an all-in-one R solution that both pulls data and charts it on the same thread.  it is slow without asynchronous design.
+#This single-threaded structure is better suited for run once calculations such as end of day reviews of tiingo / API data
 #There is a significant amount of computation going on.  This will likely need to be converted into 2 instances + SQL server to make UI usable
+
+#This software is still heavily under development, and needs light manual massaging to run.
+#1. StockTickers variable needs to point to a local filepath (shiny was not finding the project directory on its own)
+
+#2. If hooking up to a local static  dataset instead of a live one, fnPopulateParentTempDataFrame and the tempData definition below it can be uncommented.
+# For a local dataset, two more calls in the server function need to be changed.  Historical Comment #1/2 and #2/2  -- defining our initial working dataset and our ongoing reactive data updates
+
+
 
 #Imports
 library(shiny)
@@ -346,8 +355,9 @@ server <- function(input, output) {
   #Initialize our datasets
   #Note -- can't just define our convolutedWOrk variable directly due to the complexity of expressions allowed in the reactiveValues fn (looks for comma after first expression)
   WorkingDataset = NULL
-  #Historical csv comment 1/2
+  #Historical Comment #1/2
   #WorkingDataset = bind_rows(WorkingDataset, fnStepThroughHistorical(tempData, 1))
+  
   #Live Yahoo
   WorkingDataset<- fnPullQuoteData_singleQuote(StockTickers,WorkingDataset)
   #options(warn = -1)
@@ -366,6 +376,7 @@ server <- function(input, output) {
     #                                                         aPeriodCount = 12, aCurrentIndex = reactiveData$i)
     #                                                  )})
     
+    #This is the live updating of data.  If using the historical query above, comment this out
      isolate({reactiveData$convolutedWork = bind_rows(reactiveData$convolutedWork, fnPullQuoteData_singleQuote(
                                                              aTickerList = StockTickers, 
                                                              aMasterTable = reactiveData$convolutedWork)
