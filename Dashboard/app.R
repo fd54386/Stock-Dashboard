@@ -5,12 +5,13 @@
 
 #This file is for an all-in-one R solution that both pulls data and charts it on the same thread.  it is slow without asynchronous design.
 #This single-threaded structure is better suited for run once calculations such as end of day reviews of tiingo / API data
-#There is a significant amount of computation going on.  This will likely need to be converted into 2 instances + SQL server to make UI usable
+#A much cleaner version that utilizes a 2nd R instance and a SQL database can be found in the Stocks_Live_Server_SQL-UI repository.
 
-#This software is still heavily under development, and needs light manual massaging to run.
-#1. StockTickers variable needs to point to a local filepath (shiny was not finding the project directory on its own)
+#This needs manual massaging to run.
+#1. StockTickers global variable needs to point to a local filepath (shiny was not finding the project directory on its own)
 
 #2. If hooking up to a local static  dataset instead of a live one, fnPopulateParentTempDataFrame and the tempData definition below it can be uncommented.
+
 # For a local dataset, two more calls in the server function need to be changed.  Historical Comment #1/2 and #2/2  -- defining our initial working dataset and our ongoing reactive data updates
 
 
@@ -25,128 +26,67 @@ library(broom)
 
 #Locally Defined Functions
 #####
-#1. 
-#Convoluted free way to get sub-minute stock data off Yahoo Finance.  Some free but rate limited 1 min interval options are available off Tiingo API (paid is $10). Yahoo solution is better able to view the whole market (and let's be honest tick closes are just as arbitrary)
-#Inputs -- list of interesting symbols, number of hours to loop the query, polling period in seconds
-#Actions -- Function will then query Yahoo Finance API for Last trade & daily aggregate stats for duration specified, 1 query every default 5 secs. Note -- locks out R session, need to update for live feedback.  Also note -- Takes 2-3 seconds for querying 500 tickers, possibly more as tibble size grows
-#Outputs a tibble with: Symbol, trade time, lasttrade, $change, %change, Daily OHL, Vol,Corresponding SPY, RelChange vs last query
-fnPullQuoteDataHours_SplitYahoo<- function(aTickerList, aHours, aPeriod_sec = 5, ...){
-  fPoints = (60/aPeriod_sec)*60*aHours
-  
-  #Do I need to predefine my tibble length?  R is notoriously slow with dynamic resizing
-  #Seemingly favored tidyverse method:
-  #bind_rows(tibbleList)
-  #rough split says ~ 100ms / 1000 loop iterations.  We have ~3 secs of idle as-is, seems acceptable for ~4000 iterations / day
-  
-  #DayTibble is our parent table that is getting populated across the 6.5 hour trading day
-  DayTibble <-  NULL
-  pointCollectionPeriod = aPeriod_sec
-  
-  for(i in 1:fPoints){
-    #We will build query table throughout the subloop.  This frontruns Yahoo's maximum query size
-    fQueryTibble = NULL
-    #Also need to save the last datapull so that we don't need to mess with sorting for relative change calculations
-    fPrevQuote = NULL
-    print(paste0(as.character(i), 'of ', as.character(fPoints), ' attempts'))
-    p1 <- Sys.time()
-    print(paste0('PreYahooTime is: ',p1))
-    for (j in 0:(ceiling(length(aTickerList) / 200) - 1))
-    {
-      fTickerShort <- aTickerList[(j*200+1):((1+j)*200) ]
-      recentQuote<- getQuote(fTickerShort)
-      recentQuote<- rownames_to_column(recentQuote, var = 'Symbol')
 
-      fQueryTibble <- bind_rows(fQueryTibble, recentQuote)
-    }
-    
-    if(!is.null(fPrevQuote)){
-      fQueryTibble <- inner_join(fQueryTibble, fPrevQuote, by = Symbol)%>% 
-        mutate(intrVol = Volume - LastVolume )%>% Select(Symbol, `Trade Time`, Last, Change, `% Change`, Open, High, Low, Volume, SPY, relSpy, relTick, intrVol)
-    }
-    
-    fPrevQuote <- fQueryTibble %>% select(Symbol, Volume) %>% rename(LastVolume = Volume)
-    
-    fQueryTibble %>% mutate(appendTime = Sys.time())
-    p2 <- Sys.time()
-    
-    print(paste0('YahooTime is: ',difftime(p2, p1, units = 'secs')))
-    
-    fQueryTibble<- fnAddIntradayIndicatorCols(fQueryTibble, DayTibble, aPeriod_sec = pointCollectionPeriod )
-    
-    p3 <- Sys.time()
-    print(paste0('PostIndicatorTime is: ', difftime(p3, p2, units = 'secs')))
-    
-    DayTibble<- bind_rows(DayTibble, fQueryTibble)
-    
-    
-    p4 <-Sys.time()
-    print(paste0('BindTime is: ', difftime(p4, p3, units = 'secs')))
-    
-    theDelay <- pointCollectionPeriod - as.numeric(difftime(Sys.time(),p1,unit="secs"))
-    Sys.sleep(max(0, theDelay))
-  }
-  
-  return(DayTibble)
-}
-#1 for Shiny
-#Pull Yahoo Quotes, 
 fnPullQuoteData_singleQuote<- function(aTickerList,aMasterTable, ...){
+  
+
+  #Free way to get sub-minute stock data off Yahoo Finance.  Intended to be used by regularly pulling quotes on a timer.  Alternative free but rate limited 1 min interval options are available off Tiingo API (paid is $10). Yahoo solution is better able to view the whole market (and let's be honest tick 'close' values are equivalent to regular quotes)
+  #Inputs -- list of interesting symbols, Table with all previous data so we can calculate indicators dependent on lagged values
+  #Actions -- Function will query Yahoo Finance API for Last trade & daily aggregate stats. Note -- Takes 2-3 seconds for querying 500 tickers.
+  #Outputs a tibble with: Symbol, trade time, lasttrade, $change, %change, Daily OHL, Vol, indicators
+  
     #We will build query table throughout the subloop.  This frontruns Yahoo's maximum query size
     fQueryTibble = NULL
     p1 <- Sys.time()
-    print(paste0('PreYahooTime is: ',p1))
+    #print(paste0('PreYahooTime is: ',p1))
     for (j in 0:(ceiling(length(aTickerList) / 200) - 1))
     {
       fTickerShort <- aTickerList[(j*200+1):min(length(aTickerList),((1+j)*200)) ]
       recentQuote<- getQuote(fTickerShort)
       recentQuote<- rownames_to_column(recentQuote, var = 'Symbol')
       fQueryTibble <- bind_rows(fQueryTibble, recentQuote)
-      #write_csv(fQueryTibble, paste0('C:/Users/Fred/Documents/GitHub/Stock Dashboard/Stock-Dashboard/phantomrow',j,'.csv'))
     }
     
     fQueryTibble<- fQueryTibble %>% mutate(appendTime = Sys.time())
-    p2 <- Sys.time()
     
-    print(paste0('YahooTime is: ',difftime(p2, p1, units = 'secs')))
-    #print(fQueryTibble)
-    #print(aMasterTable)
+    #p2 <- Sys.time()
+    #print(paste0('YahooTime is: ',difftime(p2, p1, units = 'secs')))
+    
     fQueryTibble<- fnAddIntradayIndicatorCols(fQueryTibble, aMasterTable, aPeriod_sec = 10 )
     
-    p3 <- Sys.time()
-    print(paste0('PostIndicatorTime is: ', difftime(p3, p2, units = 'secs')))
-    #write_csv(fQueryTibble, 'C:/Users/Fred/Documents/GitHub/Stock Dashboard/Stock-Dashboard/phantomrow.csv')
-    #print(fQueryTibble$Symbol[497,])
-    
+    #p3 <- Sys.time()
+    #print(paste0('PostIndicatorTime is: ', difftime(p3, p2, units = 'secs')))
+
   return(fQueryTibble)
 }
 
-
-
-#2. Psuedo live querying -- read .csv files row by row to simulate active trade day on weekends.  Could also be used to review trades / practice.
-#Input -- Dataframe imported as a global variable from previous yahoo queries -- need an extra `Index` field based on query timestamp.  2nd argument is an index to hook into the extra field.
-#Actions -- Takes Modulus of index vs maximum file index.  Takes file at filepath and subsets out the requested index
-#Output -- One Set of Quotes
 fnStepThroughHistorical <- function(aDataFrame, aIndex){
+  #Psuedo live querying -- read .csv files row by row to simulate active trade day on weekends.  Could also be used to review trades / practice.
+  #Input -- Dataframe imported as a global variable from previous yahoo queries -- need an extra `Index` field based on query timestamp.  2nd argument is an index to hook into the extra field.
+  #Actions -- Takes Modulus of index vs maximum file index.  Takes file at filepath and subsets out the requested index
+  #Output -- One Set of quote data
   fMaxIndex = max(aDataFrame$Index)
   
   return(aDataFrame[aDataFrame$Index == aIndex%%fMaxIndex,])
   
 } 
 
-#1.A
-#For ongoing data collection, Add indicators in a reasonable way, without calculating across all collected periods, just most recent
-#Input -- Most recent datapull entries.  Master Dataframe with all trade data.  We will filter against the $appendTime using the periodCount specified for indicators
-#Actions -- Subset Master, send recent datapull + old subset into indicator function
-#Output -- Returns most recent datapoints with requested indicators appended on.
-#Note -- this version is insufficient for good indicator scalability.  Works with one hardcoded indicator function.  Will ideally want a 2nd nested loop through a list of functions
-
 fnAddIntradayIndicatorCols <- function(aRecentDatapoints, aMasterDataFrame, aPeriodCount = 12, aPeriod_sec){
+  #1.A
+  #For ongoing data collection, Add indicators in a reasonable way, without calculating across all collected periods, just most recent
+  #Input -- Most recent datapull entries.  Master Dataframe with all trade data.  We will filter against the $appendTime using the periodCount specified for indicators
+  #Actions -- Subset Master, send recent datapull + old subset into indicator function
+  #Output -- Returns most recent single pull with requested indicator columns appended on.
+  #Note -- extra indicators currently need static function calls within the bind_cols function.  Not a dynamic solution.
+  
   #We are building the output tib row by row to avoid excessive joining logic & column management
   fOutputTib = NULL
   
   
   #Subset Out Most Recent number of points based on indicator requested aPeriodCount and datacollection aPeriod_sec
   if(!is.null(aMasterDataFrame)){
+  #print('trying to arrange old rows')
+    
   fOldRows <- aMasterDataFrame[aMasterDataFrame$appendTime > (Sys.time()- ((aPeriodCount+.9) * aPeriod_sec)), ]
   fOldRows <- fOldRows %>% arrange(Symbol, appendTime)
   
@@ -171,9 +111,9 @@ fnAddIntradayIndicatorCols <- function(aRecentDatapoints, aMasterDataFrame, aPer
   return(fOutputTib)
 }
 
-#2.A 
-#Similar to 1.A however we will key off of index instead of time for our lookbacks.
 fnAddIntradayIndicatorCols_Index <- function(aRecentDatapoints, aMasterDataFrame, aPeriodCount = 12, aCurrentIndex){
+  #Similar to the non-index function above, however we will key off of index instead of time for our lookbacks.
+  
   #We are building the output tib row by row to avoid excessive joining logic & column management
   fOutputTib = NULL
   
@@ -198,12 +138,14 @@ fnAddIntradayIndicatorCols_Index <- function(aRecentDatapoints, aMasterDataFrame
   return(fOutputTib)
 }
 
-#1/2 B  Calculate the indicators for our intraday logging
-#Input -- Dataframe for the most recent datapoint and intended period to calculate over
-#Actions -- Run the math
-#Output -- Single row tibble with only the indicator output columns
-#Note -- currently only adding one set of indicator variables.  Would potentially modify fn 1A to run a list of indicator functions in a loop, each would have a different 1.B equivalent
 fnLiveIndicators<- function(aDataFrame){
+  #1/2 B  Calculate the indicators for our intraday logging
+  #Input -- Dataframe for the most recent datapoint and intended period to calculate over
+  #Actions -- Run the math
+  #Output -- Single row tibble with only the indicator output columns
+  #Note -- currently only adding one set of indicator variables.  Would potentially modify fn 1A to run a list of indicator functions in a loop, each would have a different 1.B equivalent
+  
+  #Note -- 12 points seems to result in stable regression solutions.
   if(nrow(aDataFrame) <12){
     return(tibble(Slope = NA, SloLoCI = NA, SloUpCI = NA))
   }
@@ -213,42 +155,22 @@ fnLiveIndicators<- function(aDataFrame){
   #times %%86400 -> times go from absolute dates to hours since midnight.  This helps with precision & helps the function solve.  With full date, the regression was computationally singular.
   
   #Note, we also have issues when there isn't a trade executed over the timeframe specified
-  #we'll run against query time for now (flat is useful!), may go for tryCatch if more shenanigans pop up.
+  #we'll run against append time for now (flat is useful!), may go for tryCatch if more shenanigans pop up.
 
   #Non-unique solution warnings -- we're running enough fits that noisy solutions are ok.
   suppressWarnings(fTrendFit<- rq(formula = Last~(as.numeric(appendTime)%% 10000), data = aDataFrame))
   fParams <- tidy(fTrendFit)
 
   return(tibble(Slope = as.numeric(fParams[2,2]), SloLoCI = as.numeric(fParams[2,3]), SloUpCI = as.numeric(fParams[2,4])))
-  
-  # tryCatch(
-  #   expr = {
-  #     fTrendFit<- rq(formula = Last~(as.numeric(queryTime)%% 5000), data = aDataFrame)
-  #     fParams <- tidy(fTrendFit)
-  #     return(tibble(Slope = as.numeric(fParams[2,1]), SloLoCI = as.numeric(fParams[2,2]), SloUpCI = as.numeric(fParams[2,3])))
-  #   },
-  #   error = function(e){
-  #     message('LAD indicator Error')
-  #     print(e)
-  #     return(tibble(Slope = NA, SloLoCI = NA, SloUpCI = NA))
-  #   },
-  #   warning = function(w){
-  #     message('LAD indicator warning')
-  #     print(w)
-  #     return(tibble(Slope = NA, SloLoCI = NA, SloUpCI = NA))
-  #     
-  #   }
-  #   
-  # )
-  # 
+
 }
 
-#Unused -- Potentially steps through entire finished dataset, but requires different dataset sorting logic -- would fit concurrent data from multiple symbols as-is.
-#For finished datasets, apply indicator functions. Has more flexibility than a mutate() & lag() design. Also more efficient than recalculating a master table
-#Inputs -- The name of the function that generates your indicator (can we change this into a list long term?), and the tibble used for calculations.  Also accepts pass through variables for the indicator function.
-#Actions -- Creates a subset of appropriate period length and sends it through the indicator function
-#Output -- The input tibble with new columns appended on
 fnAddIndicatorColumns_FinishedSet <- function(aIndicatorFunction, aDataFrame, aNRowsFit = 12, ...){
+  #Unused -- Potentially steps through entire finished dataset, but requires different dataset sorting logic -- would fit concurrent data from multiple symbols as-is.
+  #For finished datasets, apply indicator functions. Has more flexibility than a mutate() & lag() design. Also more efficient than recalculating a master table
+  #Inputs -- The name of the function that generates your indicator (can we change this into a list long term?), and the tibble used for calculations.  Also accepts pass through variables for the indicator function.
+  #Actions -- Creates a subset of appropriate period length and sends it through the indicator function
+  #Output -- The input tibble with new columns appended on
   fIndicatorCols = NULL
   
   for(i in aNRowsFit:nrow(aDataFrame)){
@@ -256,37 +178,6 @@ fnAddIndicatorColumns_FinishedSet <- function(aIndicatorFunction, aDataFrame, aN
   }
   
   return(fIndicatorCols)
-}
-
-#Unused -- works with finished set indicator columns.  Calculate LAD regression parameters for trends vs time.  Include Confidence Intervals.  Note -- no predictive power observed from preliminary testing, even when comparing against CI bounds
-fnCalcLocalSlope <- function(aDataFrame){
-  fTrendFit<- rq(formula = Last~(as.numeric(`Trade Time`)%% 86400), data = aDataFrame)
-  fParams <- tidy(fTrendFit)
-  return(tibble(Slope = as.numeric(fParams[2,1]), SloLoCI = as.numeric(fParams[2,2]), SloUpCI = as.numeric(fParams[2,3])))
-}
-#Unused -- Manual calculation of SLR parameters to help with smaller datasets
-#LSE and error estimates from linear models with R, 2E by Faraway
-fnSlowCalcSlope <- function(aDataFrame, aAlpha = .99) {
-  #Need sizing to populate the matrices
-  fPoints <- nrow(aDataFrame)
-  
-  #define our x and y matrices
-  #Note we aren't using the timestamps as precision interferes with the ability of software to solve.
-  matX <- as.matrix(cbind(replicate(fPoints,1), 1:fPoints))
-  y <- as.matrix(aDataFrame$close)
-  
-  #define intermediate matrices and terms needed to solve for Betas with linear algebra.
-  XtX <- t(matX)%*%matX
-  invXtX <- solve(XtX)
-  hatMatrix<- matX%*%invXtX%*%t(matX)
-  RSS <- t(y)%*%(diag(fPoints)-hatMatrix)%*%y
-  
-  #Useful terms.  Beta for slope and intercept.  
-  bMat <- invXtX%*%t(matX)%*%y
-  #note, p = 2 since we have slope and intercept
-  seSlope <- sqrt(invXtX[2,2])*sqrt(RSS/(fPoints-2))
-  
-  return(tibble(estimate = bMat[2,1], std.error = seSlope, lowerCI = bMat[2,1] + seSlope *qnorm((1-aAlpha)/2), upperCI = estimate - std.error *qnorm((1-aAlpha)/2)))
 }
 
 #####
@@ -298,9 +189,7 @@ fnSlowCalcSlope <- function(aDataFrame, aAlpha = .99) {
 #http://www.nasdaq.com/screening/companies-by-name.aspx?letter=0&exchange=all&render=download 
 StockTickers<- read_csv("C:/Users/Fred/Documents/GitHub/Stock Dashboard/Stock-Dashboard/HighMKTCapHighVolTickers_20220610.csv")$value
 
-#2. Local Dataset with SPY and one other ticker for evaluation
-#Hide this in a function that's easy to comment out when unnecessary.
-#Long term, should probably have live vs dataset feeds controllable from UI
+##2. Local Dataset with SPY and one other ticker for evaluation
 # fnPopulateParentTempDataFrame<- function(){
 # fTempData <- read_csv("C:/Users/Fred/Documents/R/Sample Data/HighValue_4secQuotes_1hr.csv")
 # fTempDF = numeric()
@@ -322,7 +211,7 @@ StockTickers<- read_csv("C:/Users/Fred/Documents/GitHub/Stock Dashboard/Stock-Da
 ui <- fluidPage(
   
   # Application title
-  titlePanel("Stock Scanner and Custom Chart Indicators"),
+  titlePanel("Custom Chart Indicators"),
   
   # Sidebar 
   sidebarLayout(
@@ -360,13 +249,14 @@ server <- function(input, output) {
   
   #Live Yahoo
   WorkingDataset<- fnPullQuoteData_singleQuote(StockTickers,WorkingDataset)
-  #options(warn = -1)
-  #options(warn = 0)
+
   #Need to put dataset into a reactive container so that the changes in observe calls stick.
+  #Update -- not completely sure this is true now that I've worked with reactive calls more, but it works and I'm moving on to other things.  May be some room for cleaner code here.
+  
   reactiveData <- reactiveValues( convolutedWork = WorkingDataset,  i = 2 )
   #Any code chunks that call auto invalidate will refresh after the specified duration (milliseconds)
   autoInvalidate <- reactiveTimer(10000)
-  #wrap this code to be a reactive expression)
+
   observe({
     autoInvalidate()
     #Historical Comment #2 / 2
@@ -379,19 +269,14 @@ server <- function(input, output) {
     #This is the live updating of data.  If using the historical query above, comment this out
      isolate({reactiveData$convolutedWork = bind_rows(reactiveData$convolutedWork, fnPullQuoteData_singleQuote(
                                                              aTickerList = StockTickers, 
-                                                             aMasterTable = reactiveData$convolutedWork)
-                                                      )
+                                                             aMasterTable = reactiveData$convolutedWork))
      })
     
     isolate({reactiveData$i = reactiveData$i+1})
-   
-    #   isolate({
-    #    print(reactiveData$convolutedWork[reactiveData$convolutedWork$Index > reactiveData$i - 12 &
-    #                                              reactiveData$convolutedWork$Symbol == input$TickerSearch,]) 
-    #   
-    # })
+ 
   })
   
+  #Ticker performance vs time
   output$Chart <- renderPlot({
     autoInvalidate()
     
@@ -403,16 +288,7 @@ server <- function(input, output) {
     })
   })
 
-   
-  # output$VolumeProfile <- renderPlot({
-  #    autoInvalidate()
-  #    
-  #    isolate({
-  #    ggplot(data = reactiveData$convolutedWork, aes(x = `Trade Time`, y= Last))+
-  #        geom_violin(aes(weight = intervalVolume, color = Symbol, fill = Symbol,  alpha = 255)) 
-  #    })
-  #  })
-  
+    #Plot the indicator with confidence intervals shaded
   output$IndicatorVsTime <- renderPlot({
     autoInvalidate()
     isolate({
@@ -424,17 +300,6 @@ server <- function(input, output) {
     })
     
   })
-  
-  #Probably want a different timer for this so that we can actually explore
-  #Also probably don't want to set a default arrangement within this invalidate call (loses all progress)
-  # output$IndicatorList <- renderDataTable({
-  #   autoInvalidate()
-  #   isolate({
-  #   arrange(reactiveData$convolutedWork[reactiveData$convolutedWork$Index == reactiveData$i-1,c('Symbol', 'Slope')], Slope, Symbol)
-  #   })
-  # })
-
-  #onStop(write_csv(isolate({reactiveData$convolutedWork}), paste0('sessionDataset_', date(Sys.time()), '.csv')))
   }
 
 # Run the application 
